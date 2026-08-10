@@ -12,7 +12,7 @@
 
 #include "winuae_builddate.h"
 
-#define WINUAEPUBLICBETA 1
+#define WINUAEPUBLICBETA 0
 #define LANG_DLL 1
 #define LANG_DLL_FULL_VERSION_MATCH 1
 
