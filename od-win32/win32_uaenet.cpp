@@ -172,6 +172,160 @@ static void *uaenet_trap_thread (void *arg)
 }
 #endif
 
+#define UAENET_WIRE_MAX 1514
+
+static int rsc_split_state = -1;
+static int rsc_split_logged;
+
+static int uaenet_rsc_split_enabled (void)
+{
+	if (rsc_split_state < 0) {
+		char *v = getenv ("WINUAE_NET_RSC_SPLIT");
+		rsc_split_state = (v && v[0] == '0') ? 0 : 1;
+	}
+	return rsc_split_state;
+}
+
+static uae_u32 uaenet_cksum_add (const uae_u8 *p, int len, uae_u32 sum)
+{
+	while (len > 1) {
+		sum += (p[0] << 8) | p[1];
+		p += 2;
+		len -= 2;
+	}
+	if (len > 0)
+		sum += p[0] << 8;
+	return sum;
+}
+
+static uae_u16 uaenet_cksum_fin (uae_u32 sum)
+{
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (uae_u16)~sum;
+}
+
+/* Npcap captures above the host's receive offload layer, so with RSC (or a
+ * virtio peer) enabled, inbound TCP arrives as coalesced segments far larger
+ * than the wire MTU.  The emulated NICs can only drop those, and each lost
+ * burst is served again at the sender's retransmission pace.  Split such a
+ * frame back into wire-sized segments with rebuilt headers and freshly
+ * computed checksums.  Only IPv4/IPv6 TCP longer than the wire maximum is
+ * touched; WINUAE_NET_RSC_SPLIT=0 delivers those unmodified.  Returns nonzero
+ * if the frame was delivered here. */
+static int uaenet_rsc_split (struct uaenetdatawin32 *sd, const uae_u8 *data, const struct pcap_pkthdr *header)
+{
+	int len = header->len;
+	const uae_u8 *ip, *tcp;
+	int ethlen, iplen, tcplen, hdrs, payload, chunkmax, off, ethertype, ipv6;
+	uae_u8 seg[UAENET_WIRE_MAX + 4];
+
+	if (len <= UAENET_WIRE_MAX || (int)header->caplen < len || !uaenet_rsc_split_enabled ())
+		return 0;
+	ethlen = 14;
+	if (len < ethlen + 40)
+		return 0;
+	ethertype = (data[12] << 8) | data[13];
+	if (ethertype == 0x8100) {
+		ethlen += 4;
+		ethertype = (data[16] << 8) | data[17];
+	}
+	ip = data + ethlen;
+	if (ethertype == 0x0800) {
+		int total;
+		ipv6 = 0;
+		if ((ip[0] >> 4) != 4)
+			return 0;
+		iplen = (ip[0] & 15) * 4;
+		total = (ip[2] << 8) | ip[3];
+		if (iplen < 20 || ip[9] != 6)
+			return 0;
+		if ((ip[6] & 0x3f) != 0 || ip[7] != 0)	/* fragment */
+			return 0;
+		if (total < iplen + 20 || ethlen + total > len)
+			return 0;
+		len = ethlen + total;
+	} else if (ethertype == 0x86dd) {
+		int pay;
+		ipv6 = 1;
+		iplen = 40;
+		if (ip[6] != 6)	/* extension headers: leave the frame alone */
+			return 0;
+		pay = (ip[4] << 8) | ip[5];
+		if (pay < 20 || ethlen + iplen + pay > len)
+			return 0;
+		len = ethlen + iplen + pay;
+	} else {
+		return 0;
+	}
+	tcp = ip + iplen;
+	tcplen = ((tcp[12] >> 4) & 15) * 4;
+	hdrs = ethlen + iplen + tcplen;
+	if (tcplen < 20 || hdrs > len)
+		return 0;
+	payload = len - hdrs;
+	chunkmax = UAENET_WIRE_MAX + (ethlen - 14) - hdrs;
+	if (payload <= 0 || chunkmax < 8)
+		return 0;
+
+	if (!rsc_split_logged) {
+		rsc_split_logged = 1;
+		write_log (_T("uaenet_win32: %d byte coalesced TCP frame, splitting into <=%d byte segments (WINUAE_NET_RSC_SPLIT=0 disables)\n"),
+			len, UAENET_WIRE_MAX);
+	}
+
+	off = 0;
+	while (off < payload) {
+		int chunk = payload - off;
+		int idx = off / chunkmax;
+		int last;
+		uae_u8 *sip = seg + ethlen, *stcp;
+		uae_u32 seq, sum;
+		uae_u16 ck;
+
+		if (chunk > chunkmax)
+			chunk = chunkmax;
+		last = off + chunk >= payload;
+		memcpy (seg, data, hdrs);
+		memcpy (seg + hdrs, data + hdrs + off, chunk);
+		stcp = sip + iplen;
+		if (!ipv6) {
+			int total = iplen + tcplen + chunk;
+			int id = (((ip[4] << 8) | ip[5]) + idx) & 0xffff;
+			sip[2] = total >> 8;
+			sip[3] = (uae_u8)total;
+			sip[4] = id >> 8;
+			sip[5] = (uae_u8)id;
+			sip[10] = sip[11] = 0;
+			ck = uaenet_cksum_fin (uaenet_cksum_add (sip, iplen, 0));
+			sip[10] = ck >> 8;
+			sip[11] = (uae_u8)ck;
+		} else {
+			int pay = tcplen + chunk;
+			sip[4] = pay >> 8;
+			sip[5] = (uae_u8)pay;
+		}
+		seq = (tcp[4] << 24) | (tcp[5] << 16) | (tcp[6] << 8) | tcp[7];
+		seq += off;
+		stcp[4] = seq >> 24;
+		stcp[5] = seq >> 16;
+		stcp[6] = seq >> 8;
+		stcp[7] = (uae_u8)seq;
+		if (!last)
+			stcp[13] &= ~(1 | 8);	/* FIN, PSH */
+		stcp[16] = stcp[17] = 0;
+		sum = uaenet_cksum_add (ipv6 ? sip + 8 : sip + 12, ipv6 ? 32 : 8, 0);
+		sum += 6 + tcplen + chunk;
+		sum = uaenet_cksum_add (stcp, tcplen + chunk, sum);
+		ck = uaenet_cksum_fin (sum);
+		stcp[16] = ck >> 8;
+		stcp[17] = (uae_u8)ck;
+		sd->gotfunc ((struct s2devstruct*)sd->user, seg, hdrs + chunk);
+		off += chunk;
+	}
+	return 1;
+}
+
 static void uaenet_trap_threadr (void *arg)
 {
 	struct uaenetdatawin32 *sd = (struct uaenetdatawin32*)arg;
@@ -186,7 +340,8 @@ static void uaenet_trap_threadr (void *arg)
 		r = ppcap_next_ex(sd->fp, &header, &pkt_data);
 		if (r == 1 && !ethernet_paused) {
 			uae_sem_wait (&sd->change_sem);
-			sd->gotfunc ((struct s2devstruct*)sd->user, pkt_data, header->len);
+			if (!uaenet_rsc_split (sd, pkt_data, header))
+				sd->gotfunc ((struct s2devstruct*)sd->user, pkt_data, header->len);
 			uae_sem_post (&sd->change_sem);
 		}
 		if (r < 0) {
